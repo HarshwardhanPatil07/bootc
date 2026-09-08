@@ -48,6 +48,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::os::fd::AsFd;
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use bootc_utils::skopeo_bin;
@@ -75,6 +76,13 @@ use crate::utils::async_task_with_spinner;
 
 // TODO use https://github.com/ostreedev/ostree-rs-ext/pull/493/commits/afc1837ff383681b947de30c0cefc70080a4f87a
 const BASE_IMAGE_PREFIX: &str = "ostree/container/baseimage/bootc";
+
+// Match the default attempt count and delay used by the Justfile's build-fetch
+// retry helper. A failed attempt has to rebuild the importer, so retries are
+// intentionally made at the whole-pull boundary instead of independently for
+// every layer.
+const PULL_MAX_ATTEMPTS: u32 = 3;
+const PULL_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// Create an ImageProxyConfig with bootc's user agent prefix set.
 ///
@@ -769,8 +777,59 @@ pub(crate) async fn pull_from_prepared(
     Ok(Box::new((*import).into()))
 }
 
-/// Wrapper for pulling a container image, wiring up status output.
-pub(crate) async fn pull(
+fn is_retryable_pull_error(transport: &str, error: &anyhow::Error) -> bool {
+    if transport != "registry" {
+        return false;
+    }
+
+    // The legacy GetBlob proxy method does not preserve a typed distinction
+    // between transient registry failures and errors such as a missing blob.
+    // Retry the opaque registry error at this top-level boundary, with the
+    // attempt limit above preventing an unbounded delay.
+    error.chain().any(|source| {
+        matches!(
+            source.downcast_ref::<ostree_ext::containers_image_proxy::Error>(),
+            Some(
+                ostree_ext::containers_image_proxy::Error::RequestInitiationFailure {
+                    method,
+                    ..
+                }
+            ) if method.as_ref() == "GetBlob"
+        )
+    })
+}
+
+async fn retry_pull_operation<F, Fut, T>(
+    transport: &str,
+    mut operation: F,
+    retry_delay: Duration,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    for attempt in 1..=PULL_MAX_ATTEMPTS {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt < PULL_MAX_ATTEMPTS && is_retryable_pull_error(transport, &error) =>
+            {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = PULL_MAX_ATTEMPTS,
+                    retry_delay_seconds = retry_delay.as_secs(),
+                    error = %error,
+                    "Container image pull failed; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the pull attempt range is non-empty")
+}
+
+async fn pull_once(
     repo: &ostree::Repo,
     imgref: &ImageReference,
     target_imgref: Option<&OstreeImageReference>,
@@ -808,6 +867,32 @@ pub(crate) async fn pull(
             Ok(pull_from_prepared(imgref, quiet, prog, *prepared_image_meta).await?)
         }
     }
+}
+
+/// Wrapper for pulling a container image, wiring up status output.
+pub(crate) async fn pull(
+    repo: &ostree::Repo,
+    imgref: &ImageReference,
+    target_imgref: Option<&OstreeImageReference>,
+    quiet: bool,
+    prog: ProgressWriter,
+    booted_deployment: Option<&ostree::Deployment>,
+) -> Result<Box<ImageState>> {
+    retry_pull_operation(
+        &imgref.transport,
+        || {
+            pull_once(
+                repo,
+                imgref,
+                target_imgref,
+                quiet,
+                prog.clone(),
+                booted_deployment,
+            )
+        },
+        PULL_RETRY_DELAY,
+    )
+    .await
 }
 
 pub(crate) async fn wipe_ostree(sysroot: Sysroot) -> Result<()> {
@@ -1402,6 +1487,99 @@ pub(crate) fn fixup_etc_fstab(root: &Dir) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn get_blob_failure(message: &str) -> anyhow::Error {
+        let error = ostree_ext::containers_image_proxy::Error::RequestInitiationFailure {
+            method: "GetBlob".into(),
+            error: message.into(),
+        };
+        anyhow::Error::from(error).context("Unencapsulating base")
+    }
+
+    #[tokio::test]
+    async fn test_retry_pull_operation_succeeds() -> Result<()> {
+        let attempts = std::cell::Cell::new(0);
+        let value = retry_pull_operation(
+            "registry",
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                async move {
+                    if attempt < PULL_MAX_ATTEMPTS {
+                        Err(get_blob_failure("502 Bad Gateway"))
+                    } else {
+                        Ok(42)
+                    }
+                }
+            },
+            Duration::ZERO,
+        )
+        .await?;
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts.get(), PULL_MAX_ATTEMPTS);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_retry_pull_operation_stops_after_max_attempts() {
+        let attempts = std::cell::Cell::new(0);
+        let error = retry_pull_operation(
+            "registry",
+            || {
+                attempts.set(attempts.get() + 1);
+                async { Err::<(), _>(get_blob_failure("blob unknown")) }
+            },
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(attempts.get(), PULL_MAX_ATTEMPTS);
+        assert_eq!(
+            error.root_cause().to_string(),
+            "failed to invoke method GetBlob: blob unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_pull_operation_does_not_retry_other_errors() {
+        let attempts = std::cell::Cell::new(0);
+        let error = retry_pull_operation(
+            "registry",
+            || {
+                attempts.set(attempts.get() + 1);
+                async { Err::<(), _>(anyhow!("invalid image configuration")) }
+            },
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(error.to_string(), "invalid image configuration");
+    }
+
+    #[tokio::test]
+    async fn test_retry_pull_operation_does_not_retry_local_storage() {
+        let attempts = std::cell::Cell::new(0);
+        let error = retry_pull_operation(
+            "containers-storage",
+            || {
+                attempts.set(attempts.get() + 1);
+                async { Err::<(), _>(get_blob_failure("local storage unavailable")) }
+            },
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(
+            error.root_cause().to_string(),
+            "failed to invoke method GetBlob: local storage unavailable"
+        );
+    }
 
     #[test]
     fn test_new_proxy_config_user_agent() {
