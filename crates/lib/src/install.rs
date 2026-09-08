@@ -195,7 +195,7 @@ use crate::bootc_composefs::{
 use crate::bootc_kargs::{INITRD_ARG_PREFIX, ROOTFLAGS_KEY};
 use crate::boundimage::{BoundImage, ResolvedBoundImage};
 use crate::containerenv::ContainerExecutionInfo;
-use crate::deploy::{MergeState, PreparedPullResult, prepare_for_pull, pull_from_prepared};
+use crate::deploy::{MergeState, PreparedPullResult, pull, pull_from_prepared};
 use crate::install::config::Filesystem as FilesystemEnum;
 use crate::lsm;
 use crate::progress_jsonl::ProgressWriter;
@@ -1073,26 +1073,34 @@ async fn install_container(
     // Auto-detection (None) is only appropriate for upgrade/switch on a running system.
     let use_unified = state.target_opts.unified_storage_exp;
 
-    let prepared = if use_unified {
+    let pulled_image = if use_unified {
         tracing::info!("Using unified storage path for installation");
-        crate::deploy::prepare_for_pull_unified(
+        let prepared = crate::deploy::prepare_for_pull_unified(
             repo,
             &spec_imgref,
             Some(&state.target_imgref),
             storage,
             None,
         )
-        .await?
-    } else {
-        prepare_for_pull(repo, &spec_imgref, Some(&state.target_imgref), None).await?
-    };
-
-    let pulled_image = match prepared {
-        PreparedPullResult::AlreadyPresent(existing) => existing,
-        PreparedPullResult::Ready(image_meta) => {
-            crate::deploy::check_disk_space_ostree(repo, &image_meta, &spec_imgref)?;
-            pull_from_prepared(&spec_imgref, false, ProgressWriter::default(), *image_meta).await?
+        .await?;
+        match prepared {
+            PreparedPullResult::AlreadyPresent(existing) => existing,
+            PreparedPullResult::Ready(image_meta) => {
+                crate::deploy::check_disk_space_ostree(repo, &image_meta, &spec_imgref)?;
+                pull_from_prepared(&spec_imgref, false, ProgressWriter::default(), *image_meta)
+                    .await?
+            }
         }
+    } else {
+        pull(
+            repo,
+            &spec_imgref,
+            Some(&state.target_imgref),
+            false,
+            ProgressWriter::default(),
+            None,
+        )
+        .await?
     };
 
     repo.set_disable_fsync(false);
